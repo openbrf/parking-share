@@ -70,8 +70,10 @@ const runsNode = (step) =>
   (step.uses !== undefined &&
     !/^actions\/(checkout|upload-artifact)@/.test(step.uses)) ||
   /\b(pnpm|npm|npx|node(?:js)?|corepack|yarn)\b/.test(step.run ?? "");
-// A command at the start of a line or after `;`, `&`, `|`, `(` or `&&`.
-const COMMAND = String.raw`(?:^|[;&|(]|\bthen\b|\bdo\b)\s*`;
+// A command at the start of a line, after `;`, `&`, `|`, `(` or `&&`, or after
+// a keyword that takes a command: `then`, `do`, `if`, `elif`, `else`, `while`,
+// `until`.
+const COMMAND = String.raw`(?:^|[;&|(]|\b(?:then|do|if|elif|else|while|until)\b)\s*`;
 // A shell option before the file: `-e`, `-eu`, `-o pipefail`, `-oe pipefail`,
 // `+x`, `--norc`. Each `o` or `O` in a group, wherever it stands (`-eo`, `-oe`),
 // takes the next word as its argument, and no other branch may match it, or the
@@ -87,16 +89,27 @@ const SHELL_OPTION = [
   String.raw`[-+]${FLAGS}[oO]${FLAGS}[oO]${FLAGS}${ARGUMENT}${ARGUMENT}`,
   String.raw`--[a-z][\w-]*`,
 ].join("|");
+const SHELL = String.raw`(?:ba|z|da|k)?sh`;
+// The command a shell is given with `-c` (`-c`, `-ec`, after other options), in
+// single quotes, double quotes or bare.
+const COMMAND_STRING = new RegExp(
+  `${COMMAND}${SHELL}(?:[ \\t]+(?:${SHELL_OPTION}))*[ \\t]+-[a-zA-Z]*c[a-zA-Z]*[ \\t]+(?:'([^']*)'|"([^"]*)"|(\\S+))`,
+  "gm",
+);
 // Whether a script runs a file by a shell (`bash x`, `bash -e x`, `sh -eu x`,
 // `sh -- x`, `source x`, `. x`) or by its path (`./x`, `source/x`, `/abs/x`),
-// as the checkout's files could be. A shell given `-c` or only options runs no
-// file. Without `--`, a word starting with `-` or `+` is an option, not the
-// file; after `--` it is the file.
+// as the checkout's files could be, also inside the command a shell is given
+// with `-c` (`bash -c './x'`). A shell given `-c` with a command that runs no
+// file, or only options, runs no file. Without `--`, a word starting with `-` or
+// `+` is an option, not the file; after `--` it is the file.
 const runsFile = (script) =>
   new RegExp(
-    `${COMMAND}(?:(?:ba|z|da|k)?sh(?:[ \\t]+(?:${SHELL_OPTION}))*(?:[ \\t]+--[ \\t]+\\S|[ \\t]+(?![-+])\\S)|(?:source|\\.)\\s+(?!-)\\S)|${COMMAND}(?:\\.{0,2}/|[\\w.-]+/)\\S`,
+    `${COMMAND}(?:${SHELL}(?:[ \\t]+(?:${SHELL_OPTION}))*(?:[ \\t]+--[ \\t]+\\S|[ \\t]+(?![-+])\\S)|(?:source|\\.)\\s+(?!-)\\S)|${COMMAND}(?:\\.{0,2}/|[\\w.-]+/)\\S`,
     "m",
-  ).test(script);
+  ).test(script) ||
+  [...script.matchAll(COMMAND_STRING)].some((match) =>
+    runsFile(match[1] ?? match[2] ?? match[3]),
+  );
 
 describe("the secret scan", () => {
   const names = (text) => [...secretReferences(text)].map(([name]) => name);
@@ -132,6 +145,17 @@ describe("the file-running scan", () => {
       "/tmp/x",
       "git fetch && bash x.sh",
       "if true; then ./x; fi",
+      "if bash source/x.sh; then :; fi",
+      "if true; then :; elif sh x; then :; fi",
+      "while ./x; do :; done",
+      "until bash x.sh; do :; done",
+      "if true; then :; else ./x; fi",
+      "bash -c './source/x.sh'",
+      'bash -c "bash source/x.sh"',
+      "sh -ec 'source/x.sh'",
+      "bash -e -c ./x.sh",
+      "bash -o pipefail -c 'cd source && ./x.sh'",
+      "git fetch && bash -c 'sh x.sh'",
       "echo hi |\n  sh x",
       "bash -e source/modules/parking-share/prepare.sh",
       "sh -eu source/x.sh",
@@ -167,6 +191,9 @@ describe("the file-running scan", () => {
       'git show "$C:modules/x/package.json" | jq -er ".version"',
       'echo "a/b" > file; bash -c "echo hi"',
       'bash -e -c "echo hi"',
+      "bash -c 'git fetch origin main'",
+      "if true; then bash -c 'echo hi'; fi",
+      "if git show \"$C:x\" | jq -e .; then :; fi",
       'sh -ec "echo hi"',
       "bash -o pipefail",
       'bash -o pipefail -c "echo hi"',
