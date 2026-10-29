@@ -72,12 +72,17 @@ const runsNode = (step) =>
   /\b(pnpm|npm|npx|node(?:js)?|corepack|yarn)\b/.test(step.run ?? "");
 // A command at the start of a line or after `;`, `&`, `|`, `(` or `&&`.
 const COMMAND = String.raw`(?:^|[;&|(]|\bthen\b|\bdo\b)\s*`;
-// Whether a script runs a file by a shell (`bash x`, `sh x`, `source x`,
-// `. x`) or by its path (`./x`, `source/x`, `/abs/x`), as the checkout's
-// files could be. A shell given only `-c` or a flag runs no file.
+// A shell option before the file: `-e`, `-eu`, `-o pipefail`, `+x`, `--norc`.
+// Not `-c`, alone or in a group (`-ec`), because the argument after it is a
+// command, not a file.
+const SHELL_OPTION = String.raw`(?:[-+][abd-zA-Z]*[oO][ \t]+\S+|[-+][abd-zA-Z]+|--[a-z][\w-]*)`;
+// Whether a script runs a file by a shell (`bash x`, `bash -e x`, `sh -eu x`,
+// `sh -- x`, `source x`, `. x`) or by its path (`./x`, `source/x`, `/abs/x`),
+// as the checkout's files could be. A shell given `-c` or only options runs no
+// file.
 const runsFile = (script) =>
   new RegExp(
-    `${COMMAND}(?:(?:ba|z|da|k)?sh|source|\\.)\\s+(?!-)\\S|${COMMAND}(?:\\.{0,2}/|[\\w.-]+/)\\S`,
+    `${COMMAND}(?:(?:ba|z|da|k)?sh(?:[ \\t]+${SHELL_OPTION})*(?:[ \\t]+--)?[ \\t]+(?!-)\\S|(?:source|\\.)\\s+(?!-)\\S)|${COMMAND}(?:\\.{0,2}/|[\\w.-]+/)\\S`,
     "m",
   ).test(script);
 
@@ -116,6 +121,15 @@ describe("the file-running scan", () => {
       "git fetch && bash x.sh",
       "if true; then ./x; fi",
       "echo hi |\n  sh x",
+      "bash -e source/modules/parking-share/prepare.sh",
+      "sh -eu source/x.sh",
+      "bash -e -u x.sh",
+      "bash -o pipefail x.sh",
+      "bash -eo pipefail x.sh",
+      "bash --norc x.sh",
+      "bash -- x.sh",
+      "sh -e -- x.sh",
+      "git fetch && sh -eu x.sh",
     ]) {
       assert.ok(runsFile(script), script);
     }
@@ -126,6 +140,11 @@ describe("the file-running scan", () => {
       'git merge-base --is-ancestor "$COMMIT" origin/main',
       'git show "$C:modules/x/package.json" | jq -er ".version"',
       'echo "a/b" > file; bash -c "echo hi"',
+      'bash -e -c "echo hi"',
+      'sh -ec "echo hi"',
+      "bash -eu",
+      "bash",
+      "bash -e\necho hi",
     ]) {
       assert.ok(!runsFile(script), script);
     }
