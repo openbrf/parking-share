@@ -72,19 +72,29 @@ const runsNode = (step) =>
   /\b(pnpm|npm|npx|node(?:js)?|corepack|yarn)\b/.test(step.run ?? "");
 // A command at the start of a line or after `;`, `&`, `|`, `(` or `&&`.
 const COMMAND = String.raw`(?:^|[;&|(]|\bthen\b|\bdo\b)\s*`;
-// A shell option before the file: `-e`, `-eu`, `-o pipefail`, `+x`, `--norc`.
-// `-o` and `-O`, alone or last in a group (`-eo`), take the next word as their
-// argument, and no other branch may match them, or the regex would take that
-// argument for the file. Not `-c`, alone or in a group (`-ec`), because the
-// argument after it is a command, not a file.
-const SHELL_OPTION = String.raw`(?:[-+][abd-zA-Z]*[oO][ \t]+\S+|[-+][abd-np-zA-NP-Z]+|--[a-z][\w-]*)`;
+// A shell option before the file: `-e`, `-eu`, `-o pipefail`, `-oe pipefail`,
+// `+x`, `--norc`. Each `o` or `O` in a group, wherever it stands (`-eo`, `-oe`),
+// takes the next word as its argument, and no other branch may match it, or the
+// regex would take that argument for the file. A group has at most two, as bash
+// would otherwise read more words than this scan follows. Not `-c`, alone or in
+// a group (`-ec`), because the argument after it is a command, not a file.
+const FLAG = String.raw`[abd-np-zA-NP-Z]`;
+const FLAGS = `${FLAG}*`;
+const ARGUMENT = String.raw`[ \t]+\S+`;
+const SHELL_OPTION = [
+  String.raw`[-+]${FLAG}+`,
+  String.raw`[-+]${FLAGS}[oO]${FLAGS}${ARGUMENT}`,
+  String.raw`[-+]${FLAGS}[oO]${FLAGS}[oO]${FLAGS}${ARGUMENT}${ARGUMENT}`,
+  String.raw`--[a-z][\w-]*`,
+].join("|");
 // Whether a script runs a file by a shell (`bash x`, `bash -e x`, `sh -eu x`,
 // `sh -- x`, `source x`, `. x`) or by its path (`./x`, `source/x`, `/abs/x`),
 // as the checkout's files could be. A shell given `-c` or only options runs no
-// file.
+// file. Without `--`, a word starting with `-` or `+` is an option, not the
+// file; after `--` it is the file.
 const runsFile = (script) =>
   new RegExp(
-    `${COMMAND}(?:(?:ba|z|da|k)?sh(?:[ \\t]+${SHELL_OPTION})*(?:[ \\t]+--)?[ \\t]+(?!-)\\S|(?:source|\\.)\\s+(?!-)\\S)|${COMMAND}(?:\\.{0,2}/|[\\w.-]+/)\\S`,
+    `${COMMAND}(?:(?:ba|z|da|k)?sh(?:[ \\t]+(?:${SHELL_OPTION}))*(?:[ \\t]+--[ \\t]+\\S|[ \\t]+(?![-+])\\S)|(?:source|\\.)\\s+(?!-)\\S)|${COMMAND}(?:\\.{0,2}/|[\\w.-]+/)\\S`,
     "m",
   ).test(script);
 
@@ -130,8 +140,20 @@ describe("the file-running scan", () => {
       "bash -eo pipefail x.sh",
       "bash -e -o pipefail x.sh",
       "bash -O extglob x.sh",
+      "bash -oe pipefail source/x.sh",
+      "bash -Oe extglob source/x.sh",
+      "bash -eOu extglob x.sh",
+      "bash -oo pipefail errexit x.sh",
+      "bash +o pipefail x.sh",
+      "bash +O extglob x.sh",
+      "bash +e x.sh",
+      "bash +eo pipefail x.sh",
+      "bash +oe pipefail x.sh",
       "bash --norc x.sh",
       "bash -- x.sh",
+      "bash -- +x",
+      "bash -- -x",
+      "bash +e -- +x",
       "sh -e -- x.sh",
       "git fetch && sh -eu x.sh",
     ]) {
@@ -151,6 +173,14 @@ describe("the file-running scan", () => {
       "bash -eo pipefail",
       "bash -e -o pipefail",
       "bash -O extglob",
+      "bash -oe pipefail",
+      "bash -Oe extglob",
+      "bash -oo pipefail errexit",
+      "bash +o pipefail",
+      "bash +O extglob",
+      "bash +oe pipefail",
+      "bash +e",
+      "bash +eu",
       "bash -eu",
       "bash",
       "bash -e\necho hi",
