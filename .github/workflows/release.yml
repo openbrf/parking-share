@@ -163,6 +163,14 @@ jobs:
             echo "::error::The tag is $TAG, which is not the version the pinned commit's package states."
             exit 1
           fi
+          # The sealed source holds the module's directory and the root files
+          # only, so a dependency on another module of the workspace would be
+          # missing when the build installs.
+          if git show "$COMMIT:modules/parking-share/package.json" |
+            jq -e '[.dependencies, .devDependencies, .optionalDependencies, .peerDependencies | objects | .[] | strings | select(startswith("workspace:"))] | length > 0' > /dev/null; then
+            echo "::error::The pinned commit's modules/parking-share/package.json depends on another module of the workspace. A release holds this module alone: pin a commit whose module depends on none."
+            exit 1
+          fi
 
       # The pinned commit alone, without the history before it, in a
       # repository of its own, so `release:pack` can tell that it builds that
@@ -327,8 +335,17 @@ jobs:
           FILE: ${{ runner.temp }}/release/${{ needs.build.outputs.file }}
           COMMIT: ${{ needs.fetch.outputs.commit }}
         run: |
-          existing="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[] | select(.tagName == env.TAG) | .tagName')"
-          if [ -z "$existing" ]; then
+          # A release not found is the only failure that means "create it".
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2> "$RUNNER_TEMP/view.err"; then
+            found=true
+          elif grep -q "release not found" "$RUNNER_TEMP/view.err"; then
+            found=false
+          else
+            echo "::error::Could not look up the release for $TAG."
+            cat "$RUNNER_TEMP/view.err"
+            exit 1
+          fi
+          if [ "$found" = false ]; then
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --draft \

@@ -307,6 +307,30 @@ describe("the release workflow", () => {
     assert.deepEqual([...named], [MODULE]);
   });
 
+  it("refuses a pin whose module depends on another module of the workspace", () => {
+    const check = release.jobs.fetch.steps.find(
+      (step) => step.name === "Check the pinned commit",
+    );
+    assert.match(check.run, /startswith\("workspace:"\)/);
+    assert.match(
+      check.run,
+      /\.dependencies, \.devDependencies, \.optionalDependencies, \.peerDependencies/,
+    );
+  });
+
+  it("looks a draft up by its tag and creates a release only when there is none", () => {
+    const create = release.jobs.publish.steps.find(
+      (step) => step.name === "Create the release",
+    );
+    // A list is capped, so a draft behind newer releases would be missed and
+    // `gh release create` would fail on the tag it already has.
+    assert.doesNotMatch(create.run, /gh release list/);
+    assert.match(create.run, /gh release view "\$TAG"/);
+    assert.match(create.run, /grep -q "release not found"/);
+    // Any other failure to look up stops the run instead of creating.
+    assert.match(create.run, /Could not look up the release/);
+  });
+
   it("sets every job's permissions", () => {
     assert.deepEqual(release.permissions, { contents: "read" });
     for (const [name, job] of jobs) {

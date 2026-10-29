@@ -89,8 +89,9 @@ it once it reads that version.
    ```
 
 The workflow refuses a tag that is not on `main`, whose `source.json` is not
-`main`'s, or that does not match the version, and a pin that is not on the
-main branch of apteoab/openbrf-modules. It fetches the pinned commit in a job
+`main`'s, or that does not match the version, a pin that is not on the
+main branch of apteoab/openbrf-modules, and a pin whose module depends on
+another module of the workspace, since a release holds this module alone. It fetches the pinned commit in a job
 that runs none of the source's code, then builds it in a job of its own,
 packs it with the pin copied in unchanged, attests the tarball and publishes
 the release. Its job summary gives the sha512 and size for the catalog entry.
