@@ -73,9 +73,11 @@ const runsNode = (step) =>
 // A command at the start of a line or after `;`, `&`, `|`, `(` or `&&`.
 const COMMAND = String.raw`(?:^|[;&|(]|\bthen\b|\bdo\b)\s*`;
 // A shell option before the file: `-e`, `-eu`, `-o pipefail`, `+x`, `--norc`.
-// Not `-c`, alone or in a group (`-ec`), because the argument after it is a
-// command, not a file.
-const SHELL_OPTION = String.raw`(?:[-+][abd-zA-Z]*[oO][ \t]+\S+|[-+][abd-zA-Z]+|--[a-z][\w-]*)`;
+// `-o` and `-O`, alone or last in a group (`-eo`), take the next word as their
+// argument, and no other branch may match them, or the regex would take that
+// argument for the file. Not `-c`, alone or in a group (`-ec`), because the
+// argument after it is a command, not a file.
+const SHELL_OPTION = String.raw`(?:[-+][abd-zA-Z]*[oO][ \t]+\S+|[-+][abd-np-zA-NP-Z]+|--[a-z][\w-]*)`;
 // Whether a script runs a file by a shell (`bash x`, `bash -e x`, `sh -eu x`,
 // `sh -- x`, `source x`, `. x`) or by its path (`./x`, `source/x`, `/abs/x`),
 // as the checkout's files could be. A shell given `-c` or only options runs no
@@ -126,6 +128,8 @@ describe("the file-running scan", () => {
       "bash -e -u x.sh",
       "bash -o pipefail x.sh",
       "bash -eo pipefail x.sh",
+      "bash -e -o pipefail x.sh",
+      "bash -O extglob x.sh",
       "bash --norc x.sh",
       "bash -- x.sh",
       "sh -e -- x.sh",
@@ -142,6 +146,11 @@ describe("the file-running scan", () => {
       'echo "a/b" > file; bash -c "echo hi"',
       'bash -e -c "echo hi"',
       'sh -ec "echo hi"',
+      "bash -o pipefail",
+      'bash -o pipefail -c "echo hi"',
+      "bash -eo pipefail",
+      "bash -e -o pipefail",
+      "bash -O extglob",
       "bash -eu",
       "bash",
       "bash -e\necho hi",
