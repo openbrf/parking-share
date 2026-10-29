@@ -70,6 +70,16 @@ const runsNode = (step) =>
   (step.uses !== undefined &&
     !/^actions\/(checkout|upload-artifact)@/.test(step.uses)) ||
   /\b(pnpm|npm|npx|node(?:js)?|corepack|yarn)\b/.test(step.run ?? "");
+// A command at the start of a line or after `;`, `&`, `|`, `(` or `&&`.
+const COMMAND = String.raw`(?:^|[;&|(]|\bthen\b|\bdo\b)\s*`;
+// Whether a script runs a file by a shell (`bash x`, `sh x`, `source x`,
+// `. x`) or by its path (`./x`, `source/x`, `/abs/x`), as the checkout's
+// files could be. A shell given only `-c` or a flag runs no file.
+const runsFile = (script) =>
+  new RegExp(
+    `${COMMAND}(?:(?:ba|z|da|k)?sh|source|\\.)\\s+(?!-)\\S|${COMMAND}(?:\\.{0,2}/|[\\w.-]+/)\\S`,
+    "m",
+  ).test(script);
 
 describe("the secret scan", () => {
   const names = (text) => [...secretReferences(text)].map(([name]) => name);
@@ -89,6 +99,36 @@ describe("the secret scan", () => {
   it("refuses a reference to secrets that names none", () => {
     assert.throws(() => names("${{ toJSON(secrets) }}"));
     assert.throws(() => names("${{ secrets['A'] }}"));
+  });
+});
+
+describe("the file-running scan", () => {
+  it("finds a file run by a shell or by its path", () => {
+    for (const script of [
+      "bash source/x.sh",
+      "sh ./x.sh",
+      "dash x.sh",
+      "source source/x.sh",
+      ". source/x.sh",
+      "./x.sh",
+      "source/x.sh",
+      "/tmp/x",
+      "git fetch && bash x.sh",
+      "if true; then ./x; fi",
+      "echo hi |\n  sh x",
+    ]) {
+      assert.ok(runsFile(script), script);
+    }
+  });
+
+  it("finds none in git and jq", () => {
+    for (const script of [
+      'git merge-base --is-ancestor "$COMMIT" origin/main',
+      'git show "$C:modules/x/package.json" | jq -er ".version"',
+      'echo "a/b" > file; bash -c "echo hi"',
+    ]) {
+      assert.ok(!runsFile(script), script);
+    }
   });
 });
 
@@ -154,6 +194,10 @@ describe("the release workflow", () => {
       assert.ok(
         !runsNode(step),
         `job ${name} holds the deploy key and runs Node in ${step.name ?? step.uses}`,
+      );
+      assert.ok(
+        !runsFile(step.run ?? ""),
+        `job ${name} holds the deploy key and runs a file in ${step.name ?? step.uses}`,
       );
       // An action is code that runs in the job, with the key in reach.
       assert.match(
