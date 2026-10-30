@@ -90,10 +90,21 @@ const SHELL_OPTION = [
   String.raw`--[a-z][\w-]*`,
 ].join("|");
 const SHELL = String.raw`(?:ba|z|da|k)?sh`;
-// The command a shell is given with `-c` (`-c`, `-ec`, after other options), in
-// single quotes, double quotes or bare.
+// The group of options that holds `-c` (`-c`, `-ec`, `-co pipefail`, `-oc
+// pipefail`). Each `o` or `O` in it takes the next word as its argument, as in
+// SHELL_OPTION, so the command is the word after those arguments, not the first
+// one. A group has at most two, as above.
+const C_FLAG = String.raw`[a-np-zA-NP-Z]`;
+const C_FLAGS = `${C_FLAG}*`;
+const C_GROUP = [
+  String.raw`-${C_FLAGS}c${C_FLAGS}`,
+  String.raw`-${C_FLAGS}(?:c${C_FLAGS}[oO]|[oO]${C_FLAGS}c)${C_FLAGS}${ARGUMENT}`,
+  String.raw`-${C_FLAGS}(?:c${C_FLAGS}[oO]${C_FLAGS}[oO]|[oO]${C_FLAGS}c${C_FLAGS}[oO]|[oO]${C_FLAGS}[oO]${C_FLAGS}c)${C_FLAGS}${ARGUMENT}${ARGUMENT}`,
+].join("|");
+// The command a shell is given with `-c` (`-c`, `-ec`, `-co pipefail`, after
+// other options), in single quotes, double quotes or bare.
 const COMMAND_STRING = new RegExp(
-  `${COMMAND}${SHELL}(?:[ \\t]+(?:${SHELL_OPTION}))*[ \\t]+-[a-zA-Z]*c[a-zA-Z]*[ \\t]+(?:'([^']*)'|"([^"]*)"|(\\S+))`,
+  `${COMMAND}${SHELL}(?:[ \\t]+(?:${SHELL_OPTION}))*[ \\t]+(?:${C_GROUP})[ \\t]+(?:'([^']*)'|"([^"]*)"|(\\S+))`,
   "gm",
 );
 // Whether a script runs a file by a shell (`bash x`, `bash -e x`, `sh -eu x`,
@@ -155,6 +166,17 @@ describe("the file-running scan", () => {
       "sh -ec 'source/x.sh'",
       "bash -e -c ./x.sh",
       "bash -o pipefail -c 'cd source && ./x.sh'",
+      "bash -co pipefail './source/x.sh'",
+      "bash -oc pipefail './source/x.sh'",
+      "bash -Oc extglob './source/x.sh'",
+      "bash -cO extglob './source/x.sh'",
+      'bash -eco pipefail "bash source/x.sh"',
+      "bash -eoc pipefail ./x.sh",
+      "bash -e -co pipefail 'source/x.sh'",
+      "bash -coo pipefail errexit './x.sh'",
+      "bash -ocO pipefail extglob './x.sh'",
+      "bash -ooc pipefail errexit './x.sh'",
+      "bash -cc './x.sh'",
       "git fetch && bash -c 'sh x.sh'",
       "echo hi |\n  sh x",
       "bash -e source/modules/parking-share/prepare.sh",
@@ -197,6 +219,15 @@ describe("the file-running scan", () => {
       'sh -ec "echo hi"',
       "bash -o pipefail",
       'bash -o pipefail -c "echo hi"',
+      "bash -co pipefail 'echo hi'",
+      "bash -oc pipefail 'echo hi'",
+      "bash -co ./x.sh 'echo hi'",
+      "bash -oc source/x.sh 'echo hi'",
+      "bash -cO extglob 'echo hi'",
+      "bash -ecO extglob 'echo hi'",
+      "bash -coo pipefail errexit 'echo hi'",
+      "bash -ocO ./x.sh ./y.sh 'echo hi'",
+      "bash -co pipefail",
       "bash -eo pipefail",
       "bash -e -o pipefail",
       "bash -O extglob",
