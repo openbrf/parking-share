@@ -1,0 +1,531 @@
+import assert from "node:assert/strict";
+import { readFile, readdir } from "node:fs/promises";
+import { describe, it } from "node:test";
+
+import { parse } from "yaml";
+
+/**
+ * Holds where the release workflow's secrets may be read. Any step of a job
+ * can read every secret the job references, and the source's install and
+ * build run third-party code, so each secret is kept to the jobs that
+ * need it, and the deploy key out of every job that runs that code.
+ */
+const workflows = new URL("../.github/workflows/", import.meta.url);
+/** The one module of apteoab/openbrf-modules this repository releases. */
+const MODULE = "parking-share";
+const read = async (name) =>
+  parse(await readFile(new URL(name, workflows), "utf8"));
+const release = await read("release.yml");
+const jobs = Object.entries(release.jobs);
+
+/** Each string anywhere in a value, with the path to it. */
+function* strings(value, path = []) {
+  if (typeof value === "string") {
+    yield [value, path];
+  } else if (value !== null && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      yield* strings(child, [...path, key]);
+    }
+  }
+}
+
+/**
+ * Each expression in a string, without its string literals. An expression
+ * ends at the first `}}` outside a literal, so a `}` in one, as in
+ * `format('{0}', ...)`, does not end it, and a literal names no secret.
+ */
+const LITERAL = /'(?:[^']|'')*'/g;
+const expressions = (text) =>
+  [...text.matchAll(/\$\{\{((?:'(?:[^']|'')*'|[^'}]|\}(?!\}))*)\}\}/g)].map(
+    ([, body]) => body.replaceAll(LITERAL, "''"),
+  );
+
+/** The names of the secrets a value refers to, with the path to each. */
+function* secretReferences(value) {
+  for (const [text, path] of strings(value)) {
+    for (const expression of expressions(text)) {
+      // Contexts and secret names are read regardless of case.
+      for (const word of expression.matchAll(/\bsecrets\b(\.\w+)?/gi)) {
+        // `secrets[...]` or `toJSON(secrets)` would hand on secrets this test
+        // cannot name.
+        assert.ok(
+          word[1],
+          `${path.join(".")} refers to secrets without naming one`,
+        );
+        yield [word[1].slice(1).toUpperCase(), path];
+      }
+    }
+  }
+}
+
+const secretsOf = (job) =>
+  new Set([...secretReferences(job)].map(([name]) => name));
+const jobsReferring = (name) =>
+  jobs.filter(([, job]) => secretsOf(job).has(name));
+const namesOf = (holders) => holders.map(([name]) => name).sort();
+const environmentOf = (job) => job.environment?.name ?? job.environment;
+// Any action but these two may run Node: they are the ones that run none of
+// the source's code.
+const runsNode = (step) =>
+  (step.uses !== undefined &&
+    !/^actions\/(checkout|upload-artifact)@/.test(step.uses)) ||
+  /\b(pnpm|npm|npx|node(?:js)?|corepack|yarn)\b/.test(step.run ?? "");
+// A command at the start of a line, after `;`, `&`, `|`, `(` or `&&`, or after
+// a keyword that takes a command: `then`, `do`, `if`, `elif`, `else`, `while`,
+// `until`.
+const COMMAND = String.raw`(?:^|[;&|(]|\b(?:then|do|if|elif|else|while|until)\b)\s*`;
+// A shell option before the file: `-e`, `-eu`, `-o pipefail`, `-oe pipefail`,
+// `+x`, `--norc`. Each `o` or `O` in a group, wherever it stands (`-eo`, `-oe`),
+// takes the next word as its argument, and no other branch may match it, or the
+// regex would take that argument for the file. A group has at most two, as bash
+// would otherwise read more words than this scan follows. Not `-c`, alone or in
+// a group (`-ec`), because the argument after it is a command, not a file.
+const FLAG = String.raw`[abd-np-zA-NP-Z]`;
+const FLAGS = `${FLAG}*`;
+const ARGUMENT = String.raw`[ \t]+\S+`;
+const SHELL_OPTION = [
+  String.raw`[-+]${FLAG}+`,
+  String.raw`[-+]${FLAGS}[oO]${FLAGS}${ARGUMENT}`,
+  String.raw`[-+]${FLAGS}[oO]${FLAGS}[oO]${FLAGS}${ARGUMENT}${ARGUMENT}`,
+  String.raw`--[a-z][\w-]*`,
+].join("|");
+const SHELL = String.raw`(?:ba|z|da|k)?sh`;
+// The group of options that holds `-c` (`-c`, `-ec`, `-co pipefail`, `-oc
+// pipefail`). Each `o` or `O` in it takes the next word as its argument, as in
+// SHELL_OPTION, so the command is the word after those arguments, not the first
+// one. A group has at most two, as above.
+const C_FLAG = String.raw`[a-np-zA-NP-Z]`;
+const C_FLAGS = `${C_FLAG}*`;
+const C_GROUP = [
+  String.raw`-${C_FLAGS}c${C_FLAGS}`,
+  String.raw`-${C_FLAGS}(?:c${C_FLAGS}[oO]|[oO]${C_FLAGS}c)${C_FLAGS}${ARGUMENT}`,
+  String.raw`-${C_FLAGS}(?:c${C_FLAGS}[oO]${C_FLAGS}[oO]|[oO]${C_FLAGS}c${C_FLAGS}[oO]|[oO]${C_FLAGS}[oO]${C_FLAGS}c)${C_FLAGS}${ARGUMENT}${ARGUMENT}`,
+].join("|");
+// The command a shell is given with `-c` (`-c`, `-ec`, `-co pipefail`, after
+// other options), in single quotes, double quotes or bare.
+const COMMAND_STRING = new RegExp(
+  `${COMMAND}${SHELL}(?:[ \\t]+(?:${SHELL_OPTION}))*[ \\t]+(?:${C_GROUP})[ \\t]+(?:'([^']*)'|"([^"]*)"|(\\S+))`,
+  "gm",
+);
+// Whether a script runs a file by a shell (`bash x`, `bash -e x`, `sh -eu x`,
+// `sh -- x`, `source x`, `. x`) or by its path (`./x`, `source/x`, `/abs/x`),
+// as the checkout's files could be, also inside the command a shell is given
+// with `-c` (`bash -c './x'`). A shell given `-c` with a command that runs no
+// file, or only options, runs no file. Without `--`, a word starting with `-` or
+// `+` is an option, not the file; after `--` it is the file.
+const runsFile = (script) =>
+  new RegExp(
+    `${COMMAND}(?:${SHELL}(?:[ \\t]+(?:${SHELL_OPTION}))*(?:[ \\t]+--[ \\t]+\\S|[ \\t]+(?![-+])\\S)|(?:source|\\.)\\s+(?!-)\\S)|${COMMAND}(?:\\.{0,2}/|[\\w.-]+/)\\S`,
+    "m",
+  ).test(script) ||
+  [...script.matchAll(COMMAND_STRING)].some((match) =>
+    runsFile(match[1] ?? match[2] ?? match[3]),
+  );
+
+describe("the secret scan", () => {
+  const names = (text) => [...secretReferences(text)].map(([name]) => name);
+
+  it("finds a secret in any expression", () => {
+    assert.deepEqual(names("${{ secrets.A }}"), ["A"]);
+    assert.deepEqual(names("x ${{ secrets.a }} ${{ SECRETS.B }}"), ["A", "B"]);
+    assert.deepEqual(names("${{ format('{0}', secrets.A) }}"), ["A"]);
+    assert.deepEqual(names("${{ format('}}', secrets.A) }}"), ["A"]);
+    assert.deepEqual(names("${{ format('it''s {0}', secrets.A) }}"), ["A"]);
+  });
+
+  it("reads no secret in a string literal or outside an expression", () => {
+    assert.deepEqual(names("secrets.A ${{ 'secrets.A' }}"), []);
+  });
+
+  it("refuses a reference to secrets that names none", () => {
+    assert.throws(() => names("${{ toJSON(secrets) }}"));
+    assert.throws(() => names("${{ secrets['A'] }}"));
+  });
+});
+
+describe("the file-running scan", () => {
+  it("finds a file run by a shell or by its path", () => {
+    for (const script of [
+      "bash source/x.sh",
+      "sh ./x.sh",
+      "dash x.sh",
+      "source source/x.sh",
+      ". source/x.sh",
+      "./x.sh",
+      "source/x.sh",
+      "/tmp/x",
+      "git fetch && bash x.sh",
+      "if true; then ./x; fi",
+      "if bash source/x.sh; then :; fi",
+      "if true; then :; elif sh x; then :; fi",
+      "while ./x; do :; done",
+      "until bash x.sh; do :; done",
+      "if true; then :; else ./x; fi",
+      "bash -c './source/x.sh'",
+      'bash -c "bash source/x.sh"',
+      "sh -ec 'source/x.sh'",
+      "bash -e -c ./x.sh",
+      "bash -o pipefail -c 'cd source && ./x.sh'",
+      "bash -co pipefail './source/x.sh'",
+      "bash -oc pipefail './source/x.sh'",
+      "bash -Oc extglob './source/x.sh'",
+      "bash -cO extglob './source/x.sh'",
+      'bash -eco pipefail "bash source/x.sh"',
+      "bash -eoc pipefail ./x.sh",
+      "bash -e -co pipefail 'source/x.sh'",
+      "bash -coo pipefail errexit './x.sh'",
+      "bash -ocO pipefail extglob './x.sh'",
+      "bash -ooc pipefail errexit './x.sh'",
+      "bash -cc './x.sh'",
+      "git fetch && bash -c 'sh x.sh'",
+      "echo hi |\n  sh x",
+      "bash -e source/modules/parking-share/prepare.sh",
+      "sh -eu source/x.sh",
+      "bash -e -u x.sh",
+      "bash -o pipefail x.sh",
+      "bash -eo pipefail x.sh",
+      "bash -e -o pipefail x.sh",
+      "bash -O extglob x.sh",
+      "bash -oe pipefail source/x.sh",
+      "bash -Oe extglob source/x.sh",
+      "bash -eOu extglob x.sh",
+      "bash -oo pipefail errexit x.sh",
+      "bash +o pipefail x.sh",
+      "bash +O extglob x.sh",
+      "bash +e x.sh",
+      "bash +eo pipefail x.sh",
+      "bash +oe pipefail x.sh",
+      "bash --norc x.sh",
+      "bash -- x.sh",
+      "bash -- +x",
+      "bash -- -x",
+      "bash +e -- +x",
+      "sh -e -- x.sh",
+      "git fetch && sh -eu x.sh",
+    ]) {
+      assert.ok(runsFile(script), script);
+    }
+  });
+
+  it("finds none in git and jq", () => {
+    for (const script of [
+      'git merge-base --is-ancestor "$COMMIT" origin/main',
+      'git show "$C:modules/x/package.json" | jq -er ".version"',
+      'echo "a/b" > file; bash -c "echo hi"',
+      'bash -e -c "echo hi"',
+      "bash -c 'git fetch origin main'",
+      "if true; then bash -c 'echo hi'; fi",
+      "if git show \"$C:x\" | jq -e .; then :; fi",
+      'sh -ec "echo hi"',
+      "bash -o pipefail",
+      'bash -o pipefail -c "echo hi"',
+      "bash -co pipefail 'echo hi'",
+      "bash -oc pipefail 'echo hi'",
+      "bash -co ./x.sh 'echo hi'",
+      "bash -oc source/x.sh 'echo hi'",
+      "bash -cO extglob 'echo hi'",
+      "bash -ecO extglob 'echo hi'",
+      "bash -coo pipefail errexit 'echo hi'",
+      "bash -ocO ./x.sh ./y.sh 'echo hi'",
+      "bash -co pipefail",
+      "bash -eo pipefail",
+      "bash -e -o pipefail",
+      "bash -O extglob",
+      "bash -oe pipefail",
+      "bash -Oe extglob",
+      "bash -oo pipefail errexit",
+      "bash +o pipefail",
+      "bash +O extglob",
+      "bash +oe pipefail",
+      "bash +e",
+      "bash +eu",
+      "bash -eu",
+      "bash",
+      "bash -e\necho hi",
+    ]) {
+      assert.ok(!runsFile(script), script);
+    }
+  });
+});
+
+describe("the release workflow", () => {
+  it("starts on a version tag only", () => {
+    assert.deepEqual(release.on, { push: { tags: ["v*"] } });
+  });
+
+  it("refers to secrets only in a step", () => {
+    assert.deepEqual([...secretReferences({ ...release, jobs: {} })], []);
+    for (const [name, job] of jobs) {
+      const { steps, ...rest } = job;
+      assert.deepEqual(
+        [...secretReferences(rest)],
+        [],
+        `job ${name} refers to a secret outside its steps`,
+      );
+      assert.notEqual(job.secrets, "inherit", `job ${name} inherits secrets`);
+    }
+  });
+
+  it("refers to the deploy key and the archive key, and no other secret", () => {
+    assert.deepEqual(
+      [...secretsOf(release)].sort(),
+      ["SOURCE_ARCHIVE_KEY", "SOURCE_DEPLOY_KEY"],
+    );
+  });
+
+  it("holds each secret in an environment of its job's own", () => {
+    const expected = { fetch: "release-source", build: "release-build" };
+    for (const [name, job] of jobs) {
+      if (secretsOf(job).size > 0) {
+        assert.equal(
+          environmentOf(job),
+          expected[name],
+          `job ${name} refers to a secret outside its environment`,
+        );
+      }
+    }
+    // The deploy key's environment is not one a job that runs the source's
+    // code runs in, whichever secrets GitHub hands that job.
+    for (const [holder] of jobsReferring("SOURCE_DEPLOY_KEY")) {
+      const environment = environmentOf(release.jobs[holder]);
+      assert.deepEqual(
+        jobs
+          .filter(([, job]) => environmentOf(job) === environment)
+          .map(([name]) => name),
+        [holder],
+        `job ${holder} shares the deploy key's environment`,
+      );
+    }
+  });
+
+  it("fetches the source in a job that runs no Node and seals what it hands on", () => {
+    const holders = jobsReferring("SOURCE_DEPLOY_KEY");
+    assert.deepEqual(
+      namesOf(holders),
+      ["fetch"],
+      "the deploy key is held by the fetch job alone",
+    );
+    const [[name, job]] = holders;
+    for (const step of job.steps) {
+      assert.ok(
+        !runsNode(step),
+        `job ${name} holds the deploy key and runs Node in ${step.name ?? step.uses}`,
+      );
+      assert.ok(
+        !runsFile(step.run ?? ""),
+        `job ${name} holds the deploy key and runs a file in ${step.name ?? step.uses}`,
+      );
+      // An action is code that runs in the job, with the key in reach.
+      assert.match(
+        step.uses ?? "actions/checkout@",
+        /^actions\/(checkout|upload-artifact)@/,
+        `job ${name} holds the deploy key and runs ${step.uses}`,
+      );
+      if (/^actions\/upload-artifact@/.test(step.uses ?? "")) {
+        assert.match(
+          step.with.path,
+          /\.enc$/,
+          `job ${name} uploads something it has not sealed`,
+        );
+      }
+    }
+    const steps = job.steps.filter((step) =>
+      secretsOf(step).has("SOURCE_DEPLOY_KEY"),
+    );
+    assert.equal(steps.length, 1);
+    assert.match(steps[0].uses, /^actions\/checkout@/);
+    assert.equal(steps[0].with["persist-credentials"], false);
+  });
+
+  it("seals the module's files and not the other modules'", () => {
+    const [seal] = release.jobs.fetch.steps.filter((step) =>
+      /\bopenssl enc\b/.test(step.run ?? ""),
+    );
+    const lines = seal.run.split("\n").map((line) => line.trim());
+    const only = (pattern) => {
+      const found = lines.filter((line) => pattern.test(line));
+      assert.equal(
+        found.length,
+        1,
+        `the seal step runs ${pattern} ${found.length} times`,
+      );
+      return lines.indexOf(found[0]);
+    };
+    // A second selection (`sparse-checkout add`, `set` with more paths) would
+    // seal another module, and a tar input other than the repository root
+    // would leave out the root files `release:pack` needs.
+    const selects = only(/\bsparse-checkout\b/);
+    assert.equal(
+      lines[selects],
+      `git -C "$pinned" sparse-checkout set --cone modules/${MODULE}`,
+    );
+    const tar = only(/\btar\b/);
+    assert.match(lines[tar], /^tar -C "\$pinned" -czf - \. \|$/);
+    for (const command of [
+      /^git -C "\$pinned" fetch [^\n]*--filter=blob:none/,
+      /^git -C "\$pinned" checkout [^\n]*FETCH_HEAD$/,
+      /^git -C "\$pinned" remote remove origin$/,
+    ]) {
+      assert.ok(
+        only(command) < tar,
+        `the seal step runs ${command} after tar`,
+      );
+    }
+    assert.ok(selects < only(/^git -C "\$pinned" checkout /));
+  });
+
+  it("hands the archive key to steps that run no Node, in their env", () => {
+    const holders = jobsReferring("SOURCE_ARCHIVE_KEY");
+    assert.deepEqual(
+      namesOf(holders),
+      ["build", "fetch"],
+      "the archive key is held by the fetch and build jobs alone",
+    );
+    for (const [name, job] of holders) {
+      for (const [secret, [index, ...path]] of secretReferences(job.steps)) {
+        if (secret !== "SOURCE_ARCHIVE_KEY") continue;
+        assert.deepEqual(
+          path,
+          ["env", "SOURCE_ARCHIVE_KEY"],
+          `job ${name} hands the archive key on other than in a step's env`,
+        );
+        assert.ok(
+          !runsNode(job.steps[Number(index)]),
+          `job ${name} hands the archive key to a step that runs Node`,
+        );
+      }
+    }
+  });
+
+  it("attests and publishes in a job that holds no secret", () => {
+    for (const [name, job] of jobs) {
+      const publishes = ["id-token", "attestations", "contents", "packages"].some(
+        (permission) => job.permissions?.[permission] === "write",
+      );
+      if (publishes) {
+        assert.deepEqual(
+          [...secretsOf(job)],
+          [],
+          `job ${name} may publish and holds a secret`,
+        );
+        assert.equal(
+          job.environment,
+          undefined,
+          `job ${name} may publish and runs in an environment`,
+        );
+      }
+    }
+  });
+
+  it("deletes the run's artifacts in a job that runs nothing of the source", () => {
+    const deleters = jobs.filter(
+      ([, job]) => job.permissions?.actions === "write",
+    );
+    assert.equal(deleters.length, 1);
+    const [[name, job]] = deleters;
+    assert.equal(
+      job.if,
+      "always()",
+      `job ${name} skips its cleanup when the run fails`,
+    );
+    assert.deepEqual(
+      [...job.needs].sort(),
+      jobs
+        .map(([other]) => other)
+        .filter((other) => other !== name)
+        .sort(),
+      `job ${name} may run before every other job has ended`,
+    );
+    assert.deepEqual([...secretsOf(job)], []);
+    assert.ok(
+      job.steps.every((step) => step.uses === undefined && !runsNode(step)),
+    );
+    // What the other jobs report could come from the source's code, so the
+    // artifacts are listed from the run instead.
+    for (const [text, path] of strings(job.steps)) {
+      for (const expression of expressions(text)) {
+        assert.doesNotMatch(
+          expression,
+          /\bneeds\b/i,
+          `job ${name} reads another job's output in ${path.join(".")}`,
+        );
+      }
+    }
+    const [step] = job.steps;
+    assert.match(step.run, /\/actions\/runs\/\$GITHUB_RUN_ID\/artifacts\b/);
+    assert.match(step.run, /\[\[ "\$id" =~ \^\[0-9\]\+\$ \]\]/);
+  });
+
+  // A workflow copied from another module's release repository keeps that
+  // module's paths unless each is changed, and would check, seal or build
+  // the wrong one.
+  it("names no module of the source but its own", async () => {
+    const text = await readFile(new URL("release.yml", workflows), "utf8");
+    const named = new Set(
+      [...text.matchAll(/\bmodules\/([\w.-]+)/g)].map(([, name]) => name),
+    );
+    assert.deepEqual([...named], [MODULE]);
+  });
+
+  it("refuses a pin whose module depends on another module of the workspace", () => {
+    const check = release.jobs.fetch.steps.find(
+      (step) => step.name === "Check the pinned commit",
+    );
+    assert.match(check.run, /startswith\("workspace:"\)/);
+    assert.match(
+      check.run,
+      /\.dependencies, \.devDependencies, \.optionalDependencies, \.peerDependencies/,
+    );
+  });
+
+  it("looks a draft up by its tag and creates a release only when there is none", () => {
+    const create = release.jobs.publish.steps.find(
+      (step) => step.name === "Create the release",
+    );
+    // A list is capped, so a draft behind newer releases would be missed and
+    // `gh release create` would fail on the tag it already has.
+    assert.doesNotMatch(create.run, /gh release list/);
+    assert.match(create.run, /gh release view "\$TAG"/);
+    assert.match(create.run, /grep -q "release not found"/);
+    // Any other failure to look up stops the run instead of creating.
+    assert.match(create.run, /Could not look up the release/);
+  });
+
+  it("sets every job's permissions", () => {
+    assert.deepEqual(release.permissions, { contents: "read" });
+    for (const [name, job] of jobs) {
+      assert.ok(
+        job.permissions,
+        `job ${name} takes the workflow's permissions`,
+      );
+    }
+  });
+});
+
+describe("every workflow", async () => {
+  const names = (await readdir(workflows)).filter((name) =>
+    /\.ya?ml$/.test(name),
+  );
+
+  for (const name of names) {
+    const workflow = await read(name);
+
+    it(`${name} pins each action by its full commit id`, () => {
+      for (const [text, path] of strings(workflow)) {
+        if (path.at(-1) === "uses") {
+          assert.match(
+            text,
+            /^[\w.-]+\/[\w./-]+@[0-9a-f]{40}$/,
+            `${name}: ${path.join(".")}`,
+          );
+        }
+      }
+    });
+
+    if (name !== "release.yml") {
+      it(`${name} refers to no secret`, () => {
+        assert.deepEqual([...secretReferences(workflow)], []);
+      });
+    }
+  }
+});
