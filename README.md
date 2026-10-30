@@ -88,13 +88,18 @@ it once it reads that version.
      --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv'
    ```
 
-The workflow refuses a tag that is not on `main`, whose `source.json` is not
-`main`'s, or that does not match the version, a pin that is not on the
-main branch of apteoab/openbrf-modules, and a pin whose module depends on
-another module of the workspace, since a release holds this module alone. It fetches the pinned commit in a job
-that runs none of the source's code, then builds it in a job of its own,
-packs it with the pin copied in unchanged, attests the tarball and publishes
-the release. Its job summary gives the sha512 and size for the catalog entry.
+The workflow refuses a tag that is not on `main`, a tag whose `source.json` is
+not `main`'s, a tag that does not match the version, a pin that is not on the
+main branch of apteoab/openbrf-modules, or a pin whose module depends on
+another module of the workspace, since a release holds this module alone. It
+fetches the pinned commit in a job that runs none of the source's code, then
+builds it in a job of its own, packs it with the pin copied in unchanged and
+attests the tarball. It then looks the release up with `gh release view`. When
+the lookup reports `release not found`, it creates the release as a draft; any
+other lookup failure stops the run. A leftover draft from a run that failed
+after creating it is found by its tag and gets its tarball replaced by the one
+this run attested. Last, it publishes the release, which makes it immutable.
+Its job summary gives the sha512 and size for the catalog entry.
 It runs neither the module's tests nor its typecheck.
 apteoab/openbrf-modules runs them on every pull request and every push to
 its main branch, the only branch a pin may name, but nothing there keeps a
